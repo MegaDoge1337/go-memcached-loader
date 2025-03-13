@@ -1,0 +1,20 @@
+services:
+  idfa:
+    image: memcached
+    ports:
+      - "33013:11211"
+
+  gaid:
+    image: memcached
+    ports:
+      - "33014:11211"
+
+  adid:
+    image: memcached
+    ports:
+      - "33015:11211"
+
+  dvid:
+    image: memcached
+    ports:
+      - "33016:11211"

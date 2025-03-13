@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "megadoge/memcached_loader/pb";
+
+message UserApps {
+  repeated uint32 apps = 1;
+  optional double lat = 2;
+  optional double lon = 3;
+}
