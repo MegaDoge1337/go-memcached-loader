@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"log"
 	"log/slog"
 	"megadoge/memcached_loader/pb"
 	"os"
@@ -24,6 +25,19 @@ type AppsInstalled struct {
 	lat     float64
 	lon     float64
 	apps    []uint32
+}
+
+func getLoggerOut(logfile string) (io.Writer, error) {
+	if logfile != "" {
+		loggerOut, err := os.OpenFile(logfile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+		if err != nil {
+			return os.Stdout, err
+		}
+
+		return loggerOut, nil
+	}
+
+	return os.Stdout, nil
 }
 
 func dotRename(path string) error {
@@ -161,10 +175,8 @@ func protobufTest() (bool, error) {
 }
 
 func main() {
-	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})
-	logger := slog.New(jsonHandler)
-
 	pattern := flag.String("pattern", "./data/appsinstalled/*.tsv.gz", "pattern for searching files")
+	logfile := flag.String("logfile", "", "path to log file")
 	test := flag.Bool("test", false, "run protobuf-message test")
 	dry := flag.Bool("dry", false, "run without sending to memcached")
 	idfa := flag.String("idfa", "127.0.0.1:33013", "memcached server address")
@@ -174,8 +186,16 @@ func main() {
 
 	flag.Parse()
 
+	loggerOut, err := getLoggerOut(*logfile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	jsonHandler := slog.NewJSONHandler(loggerOut, &slog.HandlerOptions{Level: slog.LevelDebug})
+	logger := slog.New(jsonHandler)
+
 	logger.Info("Application started")
-	logger.Debug("Current configuration", "pattern", *pattern, "test", *test, "dry", *dry, "idfa", *idfa, "gaid", *gaid, "adid", *adid, "dvid", *dvid)
+	logger.Debug("Current configuration", "pattern", *pattern, "logfile", logfile, "test", *test, "dry", *dry, "idfa", *idfa, "gaid", *gaid, "adid", *adid, "dvid", *dvid)
 
 	if *test {
 		logger.Info("Run protobuf message test")
@@ -294,7 +314,7 @@ func main() {
 			fi.Close()
 			err := dotRename(e)
 			if err != nil {
-				logger.Error("Failed to rename file", "file", e)
+				logger.Error("Failed to rename file", "file", e, "error", err)
 			}
 			continue
 		}
@@ -310,7 +330,7 @@ func main() {
 		fi.Close()
 		err = dotRename(e)
 		if err != nil {
-			logger.Error("Failed to rename file", "file", e)
+			logger.Error("Failed to rename file", "file", e, "error", err)
 		}
 	}
 
