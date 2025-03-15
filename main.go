@@ -2,6 +2,7 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"errors"
 	"flag"
 	"io"
@@ -9,9 +10,12 @@ import (
 	"log/slog"
 	"megadoge/memcached_loader/pb"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	"google.golang.org/protobuf/proto"
@@ -100,6 +104,189 @@ func insertAppInstalled(mc *memcache.Client, key string, value []byte) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+func worker(id int, ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger, dry bool, filePath string, idfa string, gaid string, adid string, dvid string) {
+	defer wg.Done()
+
+	deviceMemc := make(map[string]*memcache.Client)
+	deviceMemc["idfa"] = memcache.New(idfa)
+	deviceMemc["gaid"] = memcache.New(gaid)
+	deviceMemc["adid"] = memcache.New(adid)
+	deviceMemc["dvid"] = memcache.New(dvid)
+
+	_, name := filepath.Split(filePath)
+	if strings.HasPrefix(name, ".") {
+		logger.Warn("Ignore processed file", "file", filePath, "workerId", id)
+		return
+	}
+
+	processed := 0
+	errors := 0
+
+	fi, err := os.Open(filePath)
+	if err != nil {
+		logger.Error("Failed to open file", "file", filePath, "error", err, "workerId", id)
+		return
+	}
+	defer fi.Close()
+
+	fz, err := gzip.NewReader(fi)
+	if err != nil {
+		logger.Error("Failed to create gzip reader", "file", filePath, "error", err, "workerId", id)
+		return
+	}
+	defer fz.Close()
+
+	s, err := io.ReadAll(fz)
+	if err != nil {
+		logger.Error("Failed to read gzip content", "file", filePath, "error", err, "workerId", id)
+		return
+	}
+
+	lines := strings.Split(string(s), "\n")
+
+	counter := 0
+
+	for _, line := range lines {
+		select {
+		case <-ctx.Done():
+			logger.Info("Worker received shutdown signal", "workerId", id)
+
+			for key, client := range deviceMemc {
+				err := client.Close()
+				if err != nil {
+					logger.Error("Failed to close client", "key", key, "error", err, "workerId", id)
+				}
+			}
+
+			err := fz.Close()
+			if err != nil {
+				logger.Error("Failed to close gzip reader", "file", filePath, "error", err, "workerId", id)
+			}
+
+			err = fi.Close()
+			if err != nil {
+				logger.Error("Failed to close file", "file", filePath, "error", err, "workerId", id)
+			}
+
+			return
+		default:
+			if counter >= 10000 {
+				break
+			}
+
+			if len(line) == 0 {
+				continue
+			}
+
+			counter += 1
+
+			appInstalled := parseAppInstalled(line)
+
+			if appInstalled.devType == "" {
+				logger.Error("Failed to parse line", "line", line, "workerId", id)
+				errors += 1
+				continue
+			}
+
+			mc, exists := deviceMemc[appInstalled.devType]
+
+			if !exists {
+				logger.Error("Unknown device", "devType", appInstalled.devType, "workerId", id)
+				errors += 1
+				continue
+			}
+
+			key := appInstalled.devType + ":" + appInstalled.devId
+
+			ua := &pb.UserApps{
+				Apps: appInstalled.apps,
+				Lat:  &appInstalled.lat,
+				Lon:  &appInstalled.lon,
+			}
+
+			packed, err := proto.Marshal(ua)
+			if err != nil {
+				logger.Error("Failed to marshal message", "message", ua, "error", err, "workerId", id)
+				errors += 1
+				continue
+			}
+
+			if dry {
+				logger.Debug("Message processed", "dry", dry, "message", packed, "workerId", id)
+				processed += 1
+				continue
+			}
+
+			result, err := insertAppInstalled(mc, key, packed)
+
+			if err != nil {
+				logger.Error("Memcached insertion failed", "message", ua, "error", err, "workerId", id)
+				errors += 1
+				continue
+			}
+
+			if result {
+				logger.Debug("Message processed", "dry", dry, "message", packed, "workerId", id)
+				processed += 1
+			}
+		}
+	}
+
+	if processed == 0 {
+		for key, client := range deviceMemc {
+			err := client.Close()
+			if err != nil {
+				logger.Error("Failed to close client", "key", key, "error", err, "workerId", id)
+			}
+		}
+
+		err := fz.Close()
+		if err != nil {
+			logger.Error("Failed to close gzip reader", "file", filePath, "error", err, "workerId", id)
+		}
+
+		err = fi.Close()
+		if err != nil {
+			logger.Error("Failed to close file", "file", filePath, "error", err, "workerId", id)
+		}
+
+		err = dotRename(filePath)
+		if err != nil {
+			logger.Error("Failed to rename file", "file", filePath, "error", err, "workerId", id)
+		}
+		return
+	}
+
+	errorRate := float64(errors) / float64(processed)
+	if errorRate < NORMAL_ERR_RATE {
+		logger.Info("Acceptable error rate. Successfull load", "errorRate", errorRate, "workerId", id)
+	} else {
+		logger.Error("High error rate. Failed load", "errorRate", errorRate, "normalErrorRate", NORMAL_ERR_RATE, "workerId", id)
+	}
+
+	for key, client := range deviceMemc {
+		err := client.Close()
+		if err != nil {
+			logger.Error("Failed to close client", "key", key, "error", err, "workerId", id)
+		}
+	}
+
+	err = fz.Close()
+	if err != nil {
+		logger.Error("Failed to close gzip reader", "file", filePath, "error", err, "workerId", id)
+	}
+
+	err = fi.Close()
+	if err != nil {
+		logger.Error("Failed to close file", "file", filePath, "error", err, "workerId", id)
+	}
+
+	err = dotRename(filePath)
+	if err != nil {
+		logger.Error("Failed to rename file", "file", filePath, "error", err, "workerId", id)
+	}
 }
 
 func compareUserApps(a, b *pb.UserApps) bool {
@@ -208,131 +395,38 @@ func main() {
 		os.Exit(0)
 	}
 
-	deviceMemc := make(map[string]*memcache.Client)
-	deviceMemc["idfa"] = memcache.New(*idfa)
-	deviceMemc["gaid"] = memcache.New(*gaid)
-	deviceMemc["adid"] = memcache.New(*adid)
-	deviceMemc["dvid"] = memcache.New(*dvid)
-
 	entries, err := filepath.Glob(*pattern)
 	if err != nil {
-		logger.Error("No matches find for defined pattern", "pattern", pattern, "error", err)
+		logger.Error("Failed to find matches for defined pattern", "pattern", pattern, "error", err)
 		os.Exit(1)
 	}
 
-	for _, e := range entries {
-
-		_, name := filepath.Split(e)
-		if strings.HasPrefix(name, ".") {
-			logger.Warn("Ignore processed file", "file", e)
-			continue
-		}
-
-		processed := 0
-		errors := 0
-
-		fi, err := os.Open(e)
-		if err != nil {
-			logger.Error("Failed to open file", "file", e, "error", err)
-			os.Exit(1)
-		}
-		defer fi.Close()
-
-		fz, err := gzip.NewReader(fi)
-		if err != nil {
-			logger.Error("Failed to create gzip reader", "file", e, "error", err)
-			os.Exit(1)
-		}
-		defer fz.Close()
-
-		s, err := io.ReadAll(fz)
-		if err != nil {
-			logger.Error("Failed to read gzip content", "file", e, "error", err)
-			os.Exit(1)
-		}
-
-		lines := strings.Split(string(s), "\n")
-
-		for _, line := range lines {
-			if len(line) == 0 {
-				continue
-			}
-
-			appInstalled := parseAppInstalled(line)
-
-			if appInstalled.devType == "" {
-				logger.Error("Failed to parse line", "line", line)
-				errors += 1
-				continue
-			}
-
-			mc, exists := deviceMemc[appInstalled.devType]
-
-			if !exists {
-				logger.Error("Unknown device", "devType", appInstalled.devType)
-				errors += 1
-				continue
-			}
-
-			key := appInstalled.devType + ":" + appInstalled.devId
-
-			ua := &pb.UserApps{
-				Apps: appInstalled.apps,
-				Lat:  &appInstalled.lat,
-				Lon:  &appInstalled.lon,
-			}
-
-			packed, err := proto.Marshal(ua)
-			if err != nil {
-				logger.Error("Failed to marshal message", "message", ua, "error", err)
-				errors += 1
-				continue
-			}
-
-			if *dry {
-				logger.Debug("Message processed", "dry", *dry, "message", packed)
-				processed += 1
-				continue
-			}
-
-			result, err := insertAppInstalled(mc, key, packed)
-
-			if err != nil {
-				logger.Error("Memcached insertion failed", "message", ua, "error", err)
-				errors += 1
-				continue
-			}
-
-			if result {
-				logger.Debug("Message processed", "dry", *dry, "message", packed)
-				processed += 1
-			}
-		}
-
-		if processed == 0 {
-			fz.Close()
-			fi.Close()
-			err := dotRename(e)
-			if err != nil {
-				logger.Error("Failed to rename file", "file", e, "error", err)
-			}
-			continue
-		}
-
-		errorRate := float64(errors) / float64(processed)
-		if errorRate < NORMAL_ERR_RATE {
-			logger.Info("Acceptable error rate. Successfull load", "errorRate", errorRate)
-		} else {
-			logger.Error("High error rate. Failed load", "errorRate", errorRate, "normalErrorRate", NORMAL_ERR_RATE)
-		}
-
-		fz.Close()
-		fi.Close()
-		err = dotRename(e)
-		if err != nil {
-			logger.Error("Failed to rename file", "file", e, "error", err)
-		}
+	if len(entries) == 0 {
+		logger.Error("No matches find for defined pattern", "pattern", pattern, "error", err)
+		os.Exit(0)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		logger.Info("Recieved close signal, shutting down gracefully...", "signal", sig)
+		cancel()
+	}()
+
+	var wg sync.WaitGroup
+
+	wg.Add(len(entries))
+
+	for id, e := range entries {
+		go worker(id, ctx, &wg, logger, *dry, e, *idfa, *gaid, *adid, *dvid)
+	}
+
+	wg.Wait()
 
 	logger.Info("Application finished")
 }
