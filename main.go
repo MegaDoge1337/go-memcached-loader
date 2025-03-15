@@ -146,8 +146,6 @@ func worker(id int, ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger
 
 	lines := strings.Split(string(s), "\n")
 
-	counter := 0
-
 	for _, line := range lines {
 		select {
 		case <-ctx.Done():
@@ -172,15 +170,10 @@ func worker(id int, ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger
 
 			return
 		default:
-			if counter >= 10000 {
-				break
-			}
 
 			if len(line) == 0 {
 				continue
 			}
-
-			counter += 1
 
 			appInstalled := parseAppInstalled(line)
 
@@ -251,11 +244,6 @@ func worker(id int, ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger
 		if err != nil {
 			logger.Error("Failed to close file", "file", filePath, "error", err, "workerId", id)
 		}
-
-		err = dotRename(filePath)
-		if err != nil {
-			logger.Error("Failed to rename file", "file", filePath, "error", err, "workerId", id)
-		}
 		return
 	}
 
@@ -283,10 +271,6 @@ func worker(id int, ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger
 		logger.Error("Failed to close file", "file", filePath, "error", err, "workerId", id)
 	}
 
-	err = dotRename(filePath)
-	if err != nil {
-		logger.Error("Failed to rename file", "file", filePath, "error", err, "workerId", id)
-	}
 }
 
 func compareUserApps(a, b *pb.UserApps) bool {
@@ -427,6 +411,18 @@ func main() {
 	}
 
 	wg.Wait()
+
+	for _, e := range entries {
+		_, name := filepath.Split(e)
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+
+		err = dotRename(e)
+		if err != nil {
+			logger.Error("Failed to rename file", "file", e, "error", err)
+		}
+	}
 
 	logger.Info("Application finished")
 }
